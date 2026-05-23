@@ -1,5 +1,5 @@
-import shutil
 from pathlib import Path
+import shutil
 
 import pandas as pd
 
@@ -154,76 +154,57 @@ def classify_yahoo(row):
 
 
 def autosize_columns(writer, sheet_name, df):
+    """
+    Ajusta ancho de columnas.
+    Fix importante: convierte floats/ints/NaN a string antes de medir len().
+    """
     worksheet = writer.sheets[sheet_name]
 
+    if df is None or df.empty:
+        for idx, col in enumerate(df.columns, start=1):
+            worksheet.column_dimensions[
+                worksheet.cell(row=1, column=idx).column_letter
+            ].width = max(len(str(col)) + 2, 10)
+        return
+
     for idx, col in enumerate(df.columns, start=1):
-        series = df[col].astype(str)
+        values = df[col].head(500).tolist()
 
-        max_len = max(
-            [len(str(col))]
-            + [len(x) for x in series.head(500).tolist()]
-        )
+        lengths = [len(str(col))]
 
-        adjusted_width = min(max(max_len + 2, 10), 35)
+        for value in values:
+            if pd.isna(value):
+                lengths.append(0)
+            else:
+                lengths.append(len(str(value)))
+
+        adjusted_width = min(max(max(lengths) + 2, 10), 35)
 
         worksheet.column_dimensions[
             worksheet.cell(row=1, column=idx).column_letter
         ].width = adjusted_width
 
 
-def check_output_writable(path: Path):
+def write_excel_safely(output_path, write_fn):
     """
-    Chequea que podamos escribir el archivo de salida.
-    Si está abierto en Excel/OneDrive, falla con un mensaje claro
-    en lugar de un traceback de openpyxl.
+    Escribe el Excel primero en un temporal y después lo mueve al destino.
+    Evita archivos corruptos si falla a mitad de escritura.
     """
-    if not path.exists():
-        return
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
-        # Abrir en modo append binario es no destructivo pero falla si está lockeado
-        with open(path, "a+b"):
-            pass
-    except PermissionError:
-        raise PermissionError(
-            f"\n\n"
-            f"========================================\n"
-            f"NO PUEDO ESCRIBIR EL ARCHIVO DE SALIDA\n"
-            f"========================================\n"
-            f"Path: {path}\n"
-            f"Probablemente lo tenés abierto en Excel.\n"
-            f"Cerralo y volvé a correr el script.\n"
-            f"========================================\n"
-        )
+    tmp_path = output_path.with_suffix(".tmp.xlsx")
 
-
-def write_excel_safely(path: Path, write_fn):
-    """
-    Escribe el Excel a un archivo temporal y después lo renombra al destino final.
-    Si el destino está lockeado, al menos queda el .tmp con los datos del run.
-
-    write_fn recibe el ExcelWriter abierto y se encarga de escribir las hojas.
-    """
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
 
     with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
         write_fn(writer)
 
-    try:
-        # shutil.move sobrescribe si el destino existe y está libre
-        shutil.move(str(tmp_path), str(path))
-    except PermissionError:
-        raise PermissionError(
-            f"\n\n"
-            f"========================================\n"
-            f"NO PUDE REEMPLAZAR EL ARCHIVO FINAL\n"
-            f"========================================\n"
-            f"Generé los datos en: {tmp_path}\n"
-            f"Pero no pude moverlos a: {path}\n"
-            f"(¿lo abriste en Excel mientras corría el script?)\n"
-            f"Cerralo y renombrá manualmente el .tmp, o volvé a correr.\n"
-            f"========================================\n"
-        )
+    if output_path.exists():
+        output_path.unlink()
+
+    shutil.move(str(tmp_path), str(output_path))
 
 
 # =============================================================================
@@ -422,9 +403,10 @@ def main():
     print("PRICE COMPARISON")
     print("========================================")
 
-    # Chequeo upfront: si el archivo de salida está abierto en Excel,
-    # avisamos antes de hacer todo el trabajo.
-    check_output_writable(COMPARACION_OUTPUT_PATH)
+    print(f"ALQUIMIA_INPUT_PATH: {ALQUIMIA_INPUT_PATH}")
+    print(f"BONISTAS_INPUT_PATH: {BONISTAS_INPUT_PATH}")
+    print(f"YAHOO_INPUT_PATH: {YAHOO_INPUT_PATH}")
+    print(f"COMPARACION_OUTPUT_PATH: {COMPARACION_OUTPUT_PATH}")
 
     if not ALQUIMIA_INPUT_PATH.exists():
         raise FileNotFoundError(
@@ -474,31 +456,13 @@ def main():
     bonos_comp = build_bonos_comparison(alquimia)
     yahoo_comp = build_yahoo_comparison(alquimia)
 
-    # Filtrar DataFrames vacíos antes del concat (evita FutureWarning de pandas)
-    frames = []
-    if not bonos_comp.empty:
-        frames.append(
-            bonos_comp.rename(columns={"precio_bonistas": "precio_externo"})
-        )
-    if not yahoo_comp.empty:
-        frames.append(
-            yahoo_comp.rename(columns={"precio_yahoo": "precio_externo"})
-        )
-
-    if frames:
-        total_comp = pd.concat(frames, ignore_index=True)
-    else:
-        total_comp = pd.DataFrame(
-            columns=[
-                "hoja_origen",
-                "ticker",
-                "precio_alquimia",
-                "precio_externo",
-                "dif_abs",
-                "dif_pct",
-                "estado",
-            ]
-        )
+    total_comp = pd.concat(
+        [
+            bonos_comp.rename(columns={"precio_bonistas": "precio_externo"}),
+            yahoo_comp.rename(columns={"precio_yahoo": "precio_externo"}),
+        ],
+        ignore_index=True,
+    )
 
     resumen_estado = (
         total_comp
@@ -511,6 +475,13 @@ def main():
     errores = total_comp[total_comp["estado"] != "OK"].copy()
 
     def write_all_sheets(writer):
+        # Orden pedido:
+        # 1. RESUMEN_ESTADO
+        # 2. ERRORES
+        # 3. BONOS_BONISTAS
+        # 4. YAHOO
+        # 5. COMPARACION_TOTAL
+
         resumen_estado.to_excel(
             writer,
             sheet_name="RESUMEN_ESTADO",
